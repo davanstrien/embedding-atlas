@@ -99,7 +99,23 @@ def find_available_port(start_port: int, max_attempts: int = 10, host="localhost
     raise RuntimeError("No available ports found in the given range")
 
 
-@click.command()
+@click.group(invoke_without_command=True)
+@click.pass_context
+@click.version_option(version=__version__, package_name="embedding_atlas")
+def cli(ctx):
+    """Embedding Atlas - Interactive visualization for large embeddings.
+
+    Run without subcommands to start the viewer (legacy behavior).
+    Use subcommands for additional functionality:
+
+      export-hf  Export atlas to Hugging Face dataset
+    """
+    # If no subcommand is given, invoke the default serve command
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(serve)
+
+
+@cli.command(name="serve", hidden=True)
 @click.argument("inputs", nargs=-1, required=True)
 @click.option("--text", default=None, help="Column containing text data.")
 @click.option("--image", default=None, help="Column containing image data.")
@@ -220,8 +236,7 @@ def find_available_port(start_port: int, max_attempts: int = 10, host="localhost
     default=None,
     help="Path to a file containing labels for the embedding view. The file should be a data frame with columns 'x', 'y', 'text', and optionally 'level' and 'priority'",
 )
-@click.version_option(version=__version__, package_name="embedding_atlas")
-def main(
+def serve(
     inputs,
     text: str | None,
     image: str | None,
@@ -380,5 +395,208 @@ def main(
     uvicorn.run(app, port=new_port, host=host, access_log=False)
 
 
+@cli.command(name="export-hf")
+@click.argument("input_file", type=click.Path(exists=True))
+@click.option(
+    "--repo-id",
+    required=True,
+    help="Hugging Face repository ID (e.g., 'username/dataset-name')",
+)
+@click.option(
+    "--private",
+    is_flag=True,
+    default=False,
+    help="Create a private dataset (default: public)",
+)
+@click.option(
+    "--token",
+    default=None,
+    envvar="HF_TOKEN",
+    help="Hugging Face API token (or set HF_TOKEN environment variable)",
+)
+@click.option(
+    "--commit-message",
+    default=None,
+    help="Custom commit message (default: 'Upload embedding atlas dataset')",
+)
+@click.option(
+    "--create-pr",
+    is_flag=True,
+    default=False,
+    help="Create a pull request instead of committing directly",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Show what would be uploaded without actually uploading",
+)
+def export_hf(
+    input_file: str,
+    repo_id: str,
+    private: bool,
+    token: str | None,
+    commit_message: str | None,
+    create_pr: bool,
+    dry_run: bool,
+):
+    """Export an embedding atlas dataset to Hugging Face Hub.
+
+    INPUT_FILE should be a .parquet file containing the atlas data with
+    required columns: projection_x, projection_y, _row_index, and optionally __neighbors.
+
+    Examples:
+
+      \b
+      # Export to a public dataset
+      embedding-atlas export-hf my-atlas.parquet --repo-id username/my-atlas
+
+      \b
+      # Export to a private dataset with token
+      embedding-atlas export-hf my-atlas.parquet \\
+        --repo-id username/my-atlas \\
+        --private \\
+        --token hf_...
+
+      \b
+      # Create a pull request instead of direct commit
+      embedding-atlas export-hf my-atlas.parquet \\
+        --repo-id username/my-atlas \\
+        --create-pr
+    """
+    import os
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    try:
+        # Load the parquet file
+        click.echo(f"Loading data from {input_file}...")
+        df = load_pandas_data(input_file)
+
+        # Validate required columns
+        required_cols = ["projection_x", "projection_y", "_row_index"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            click.echo(
+                f"Error: Missing required columns: {', '.join(missing_cols)}",
+                err=True,
+            )
+            click.echo(
+                "\nRequired columns for HF export:",
+                err=True,
+            )
+            click.echo("  - projection_x: X coordinate of 2D projection", err=True)
+            click.echo("  - projection_y: Y coordinate of 2D projection", err=True)
+            click.echo("  - _row_index: Unique row identifier", err=True)
+            click.echo(
+                "\nOptional but recommended:",
+                err=True,
+            )
+            click.echo(
+                "  - __neighbors: Pre-computed K-nearest neighbors",
+                err=True,
+            )
+            sys.exit(1)
+
+        # Create DataSource with metadata
+        # Try to detect text column for metadata
+        text_col = None
+        for col in df.columns:
+            if col not in required_cols and df[col].dtype == "object":
+                text_col = col
+                break
+
+        props = make_embedding_atlas_props(
+            row_id="_row_index",
+            x="projection_x",
+            y="projection_y",
+            neighbors="__neighbors" if "__neighbors" in df.columns else None,
+            text=text_col,
+        )
+
+        metadata = {"props": props}
+
+        hasher = Hasher()
+        hasher.update(__version__)
+        hasher.update([input_file])
+        hasher.update(metadata)
+        identifier = hasher.hexdigest()
+
+        data_source = DataSource(identifier, df, metadata)
+
+        if dry_run:
+            click.echo("\n=== DRY RUN ===")
+            click.echo(f"Would upload to: https://huggingface.co/datasets/{repo_id}")
+            click.echo(f"Dataset size: {len(df):,} rows")
+            click.echo(f"Columns: {list(df.columns)}")
+            click.echo(f"Private: {private}")
+            click.echo(f"Create PR: {create_pr}")
+            if commit_message:
+                click.echo(f"Commit message: {commit_message}")
+            click.echo("\nFiles that would be uploaded:")
+            click.echo("  - dataset.parquet")
+            click.echo("  - metadata.json")
+            click.echo("  - README.md")
+            if data_source.cache_path.exists():
+                cache_files = list(data_source.cache_path.glob("*.json"))
+                if cache_files:
+                    click.echo(f"  - cache/*.json ({len(cache_files)} files)")
+            click.echo("\nNo files were uploaded (dry run).")
+            return
+
+        # Check authentication
+        if token is None:
+            if "HF_TOKEN" not in os.environ:
+                click.echo(
+                    "Error: No Hugging Face token provided. Set --token or HF_TOKEN environment variable.",
+                    err=True,
+                )
+                sys.exit(1)
+
+        # Upload to HF
+        click.echo(f"\nUploading to Hugging Face: {repo_id}")
+        click.echo(f"Privacy: {'Private' if private else 'Public'}")
+
+        url = data_source.push_to_hub(
+            repo_id=repo_id,
+            private=private,
+            token=token,
+            commit_message=commit_message,
+            create_pr=create_pr,
+        )
+
+        click.echo(f"\n✓ Successfully uploaded to: {url}")
+
+        if create_pr:
+            click.echo(
+                "\nA pull request was created. Visit the URL above to review and merge it."
+            )
+        else:
+            click.echo("\nYou can now:")
+            click.echo(f"  - View the dataset: {url}")
+            click.echo(f"  - Load in Python: embedding-atlas from-hf {repo_id}")
+            click.echo(
+                f"  - Create static viewer: embedding-atlas generate-static-viewer --source hf://datasets/{repo_id}"
+            )
+
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        import traceback
+
+        if logging.getLogger().level == logging.DEBUG:
+            traceback.print_exc()
+        sys.exit(1)
+
+
+# Keep backward compatibility with old entry point
+def main():
+    """Legacy entry point for backward compatibility."""
+    cli(prog_name="embedding-atlas")
+
+
 if __name__ == "__main__":
-    main()
+    cli()
