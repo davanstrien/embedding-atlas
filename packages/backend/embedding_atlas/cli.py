@@ -147,7 +147,7 @@ def import_modules(names: list[str]):
 
 
 @click.command()
-@click.argument("inputs", nargs=-1, required=True)
+@click.argument("inputs", nargs=-1, required=False)
 @click.option("--text", default=None, help="Column containing text data.")
 @click.option("--image", default=None, help="Column containing image data.")
 @click.option(
@@ -332,6 +332,17 @@ def import_modules(names: list[str]):
     default=False,
     help="Enable MCP (Model Context Protocol) server endpoints for external tool integration.",
 )
+@click.option(
+    "--dataset-url",
+    default=None,
+    help="Remote HTTPS URL to a parquet file. Loads data directly via DuckDB httpfs "
+    "instead of downloading locally. Requires --duckdb server.",
+)
+@click.option(
+    "--hf-token",
+    default=None,
+    help="Bearer token for accessing private Hugging Face datasets with --dataset-url.",
+)
 @click.version_option(version=__version__, package_name="embedding_atlas")
 def main(
     inputs,
@@ -370,99 +381,118 @@ def main(
     stop_words: str | None,
     labels: str | None,
     enable_mcp: bool,
+    dataset_url: str | None,
+    hf_token: str | None,
 ):
     apply_logging_config()
 
     if with_modules is not None:
         import_modules(with_modules)
 
-    df = load_datasets(inputs, splits=split, query=query, sample=sample)
-
-    print(df)
-
-    if enable_projection and (x_column is None or y_column is None):
-        # No x, y column selected, first see if text/image/vectors column is specified, if not, ask for it
-        if text is None and image is None and vector is None:
-            text = prompt_for_column(
-                df, "Select a column you want to run the embedding on"
-            )
-        umap_args = {}
-        if umap_min_dist is not None:
-            umap_args["min_dist"] = umap_min_dist
-        if umap_n_neighbors is not None:
-            umap_args["n_neighbors"] = umap_n_neighbors
-        if umap_random_state is not None:
-            umap_args["random_state"] = umap_random_state
-        if umap_metric is not None:
-            umap_args["metric"] = umap_metric
-        # Run embedding and projection
-        if text is not None or image is not None or vector is not None:
-            from .projection import (
-                compute_image_projection,
-                compute_text_projection,
-                compute_vector_projection,
+    if dataset_url is not None:
+        # Remote parquet mode: load data via DuckDB httpfs, no local download
+        if duckdb != "server":
+            raise click.UsageError("--dataset-url requires --duckdb server")
+        if inputs:
+            raise click.UsageError("--dataset-url cannot be used with input files")
+        if export_application is not None:
+            raise click.UsageError(
+                "--dataset-url cannot be used with --export-application"
             )
 
-            x_column = find_column_name(df.columns, "projection_x")
-            y_column = find_column_name(df.columns, "projection_y")
-            if neighbors_column is None:
-                neighbors_column = find_column_name(df.columns, "__neighbors")
-                new_neighbors_column = neighbors_column
-            else:
-                # If neighbors_column is already specified, don't overwrite it.
-                new_neighbors_column = None
-            if vector is not None:
-                compute_vector_projection(
-                    df,
-                    vector=vector,
-                    x=x_column,
-                    y=y_column,
-                    neighbors=new_neighbors_column,
-                    umap_args=umap_args,
-                )
-            elif text is not None:
-                # Build kwargs for litellm projector
-                litellm_kwargs = {}
-                if api_key is not None:
-                    litellm_kwargs["api_key"] = api_key
-                if api_base is not None:
-                    litellm_kwargs["api_base"] = api_base
-                if dimensions is not None:
-                    litellm_kwargs["dimensions"] = dimensions
-                if sync:
-                    litellm_kwargs["sync"] = sync
+        print(f"Loading remote dataset from {dataset_url}")
+        id_column = "__row_index__"
+    else:
+        if not inputs:
+            raise click.UsageError("Either provide input files or use --dataset-url")
 
-                compute_text_projection(
-                    df,
-                    text=text,
-                    x=x_column,
-                    y=y_column,
-                    neighbors=new_neighbors_column,
-                    model=model,
-                    text_projector=text_projector,
-                    trust_remote_code=trust_remote_code,
-                    batch_size=batch_size,
-                    umap_args=umap_args,
-                    **litellm_kwargs,
-                )
-            elif image is not None:
-                compute_image_projection(
-                    df,
-                    image=image,
-                    x=x_column,
-                    y=y_column,
-                    neighbors=new_neighbors_column,
-                    model=model,
-                    trust_remote_code=trust_remote_code,
-                    batch_size=batch_size,
-                    umap_args=umap_args,
-                )
-            else:
-                raise RuntimeError("unreachable")
+        df = load_datasets(inputs, splits=split, query=query, sample=sample)
+        print(df)
 
-    id_column = find_column_name(df.columns, "__row_index__")
-    df[id_column] = range(df.shape[0])
+        if enable_projection and (x_column is None or y_column is None):
+            # No x, y column selected, first see if text/image/vectors column is specified, if not, ask for it
+            if text is None and image is None and vector is None:
+                text = prompt_for_column(
+                    df, "Select a column you want to run the embedding on"
+                )
+            umap_args = {}
+            if umap_min_dist is not None:
+                umap_args["min_dist"] = umap_min_dist
+            if umap_n_neighbors is not None:
+                umap_args["n_neighbors"] = umap_n_neighbors
+            if umap_random_state is not None:
+                umap_args["random_state"] = umap_random_state
+            if umap_metric is not None:
+                umap_args["metric"] = umap_metric
+            # Run embedding and projection
+            if text is not None or image is not None or vector is not None:
+                from .projection import (
+                    compute_image_projection,
+                    compute_text_projection,
+                    compute_vector_projection,
+                )
 
+                x_column = find_column_name(df.columns, "projection_x")
+                y_column = find_column_name(df.columns, "projection_y")
+                if neighbors_column is None:
+                    neighbors_column = find_column_name(df.columns, "__neighbors")
+                    new_neighbors_column = neighbors_column
+                else:
+                    # If neighbors_column is already specified, don't overwrite it.
+                    new_neighbors_column = None
+                if vector is not None:
+                    compute_vector_projection(
+                        df,
+                        vector=vector,
+                        x=x_column,
+                        y=y_column,
+                        neighbors=new_neighbors_column,
+                        umap_args=umap_args,
+                    )
+                elif text is not None:
+                    # Build kwargs for litellm projector
+                    litellm_kwargs = {}
+                    if api_key is not None:
+                        litellm_kwargs["api_key"] = api_key
+                    if api_base is not None:
+                        litellm_kwargs["api_base"] = api_base
+                    if dimensions is not None:
+                        litellm_kwargs["dimensions"] = dimensions
+                    if sync:
+                        litellm_kwargs["sync"] = sync
+
+                    compute_text_projection(
+                        df,
+                        text=text,
+                        x=x_column,
+                        y=y_column,
+                        neighbors=new_neighbors_column,
+                        model=model,
+                        text_projector=text_projector,
+                        trust_remote_code=trust_remote_code,
+                        batch_size=batch_size,
+                        umap_args=umap_args,
+                        **litellm_kwargs,
+                    )
+                elif image is not None:
+                    compute_image_projection(
+                        df,
+                        image=image,
+                        x=x_column,
+                        y=y_column,
+                        neighbors=new_neighbors_column,
+                        model=model,
+                        trust_remote_code=trust_remote_code,
+                        batch_size=batch_size,
+                        umap_args=umap_args,
+                    )
+                else:
+                    raise RuntimeError("unreachable")
+
+        id_column = find_column_name(df.columns, "__row_index__")
+        df[id_column] = range(df.shape[0])
+
+    # Build props (shared between both modes)
     stop_words_resolved = None
     if stop_words is not None:
         stop_words_df = load_pandas_data(stop_words)
@@ -488,13 +518,18 @@ def main(
         "props": props,
     }
 
-    hasher = Hasher()
-    hasher.update(__version__)
-    hasher.update(inputs)
-    hasher.update(metadata)
-    identifier = hasher.hexdigest()
+    if dataset_url is not None:
+        dataset = None
+        server_metadata = metadata
+    else:
+        hasher = Hasher()
+        hasher.update(__version__)
+        hasher.update(inputs)
+        hasher.update(metadata)
+        identifier = hasher.hexdigest()
 
-    dataset = DataSource(identifier, df, metadata)
+        dataset = DataSource(identifier, df, metadata)
+        server_metadata = None
 
     if static is None:
         static = str((pathlib.Path(__file__).parent / "static").resolve())
@@ -520,7 +555,14 @@ def main(
             ]
 
     app = make_server(
-        dataset, static_path=static, duckdb_uri=duckdb, mcp=enable_mcp, cors=cors_config
+        dataset,
+        static_path=static,
+        duckdb_uri=duckdb,
+        mcp=enable_mcp,
+        cors=cors_config,
+        dataset_url=dataset_url,
+        hf_token=hf_token,
+        metadata=server_metadata,
     )
 
     if enable_auto_port:

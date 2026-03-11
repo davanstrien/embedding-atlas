@@ -20,12 +20,15 @@ from .utils import arrow_to_bytes, to_parquet_bytes
 
 
 def make_server(
-    data_source: DataSource,
+    data_source: DataSource | None,
     *,
     static_path: str,
     mcp: bool = False,
     cors: bool | list[str] = False,
     duckdb_uri: str | None = None,
+    dataset_url: str | None = None,
+    hf_token: str | None = None,
+    metadata: dict | None = None,
 ):
     """Creates a server for hosting Embedding Atlas"""
 
@@ -49,12 +52,13 @@ def make_server(
                 expose_headers=["*"],
             )
 
-    mount_bytes(
-        app,
-        "/data/dataset.parquet",
-        "application/octet-stream",
-        lambda: to_parquet_bytes(data_source.dataset),
-    )
+    if data_source is not None:
+        mount_bytes(
+            app,
+            "/data/dataset.parquet",
+            "application/octet-stream",
+            lambda: to_parquet_bytes(data_source.dataset),
+        )
 
     @app.get("/data/metadata.json")
     async def get_metadata():
@@ -85,14 +89,21 @@ def make_server(
         if mcp:
             meta["mcp"] = {"type": "websocket"}
 
-        return data_source.metadata | meta
+        base_metadata = (
+            data_source.metadata if data_source is not None else (metadata or {})
+        )
+        return base_metadata | meta
 
     @app.post("/data/cache/{name}")
     async def post_cache(request: Request, name: str):
+        if data_source is None:
+            return Response(status_code=501)
         data_source.cache_set(name, await request.json())
 
     @app.get("/data/cache/{name}")
     async def get_cache(name: str):
+        if data_source is None:
+            return Response(status_code=404)
         obj = data_source.cache_get(name)
         if obj is None:
             return Response(status_code=404)
@@ -100,11 +111,20 @@ def make_server(
 
     @app.get("/data/archive.zip")
     async def make_archive():
+        if data_source is None:
+            return Response(status_code=501)
         data = data_source.make_archive(static_path)
         return Response(content=data, media_type="application/zip")
 
     if duckdb_uri == "server":
-        duckdb_connection = make_duckdb_connection(data_source.dataset)
+        if dataset_url is not None:
+            duckdb_connection = make_duckdb_connection(
+                dataset_url=dataset_url, hf_token=hf_token
+            )
+        elif data_source is not None:
+            duckdb_connection = make_duckdb_connection(data_source.dataset)
+        else:
+            duckdb_connection = None
     else:
         duckdb_connection = None
 
@@ -299,10 +319,33 @@ def make_mcp_proxy(app: FastAPI):
         return await handler.send_request(await request.json())
 
 
-def make_duckdb_connection(df):
+def make_duckdb_connection(df=None, *, dataset_url=None, hf_token=None):
     con = duckdb.connect(":memory:")
-    _ = df  # used in the query
-    con.sql("CREATE TABLE dataset AS (SELECT * FROM df)")
+    if dataset_url is not None:
+        if not dataset_url.startswith("https://"):
+            raise ValueError("--dataset-url must be an HTTPS URL")
+        con.sql("INSTALL httpfs")
+        con.sql("LOAD httpfs")
+        if hf_token:
+            con.execute(
+                "SET http_extra_headers = MAP {'Authorization': ?}",
+                [f"Bearer {hf_token}"],
+            )
+        safe_url = dataset_url.replace("'", "''")
+        con.sql(f"CREATE TABLE dataset AS (SELECT * FROM read_parquet('{safe_url}'))")
+        # Ensure __row_index__ exists for the frontend
+        cols = [row[0] for row in con.sql("DESCRIBE dataset").fetchall()]
+        if "__row_index__" not in cols:
+            con.sql(
+                "CREATE TABLE _tmp AS SELECT *, "
+                "(row_number() OVER () - 1)::INTEGER AS __row_index__ "
+                "FROM dataset"
+            )
+            con.sql("DROP TABLE dataset")
+            con.sql("ALTER TABLE _tmp RENAME TO dataset")
+    else:
+        _ = df  # used in the query
+        con.sql("CREATE TABLE dataset AS (SELECT * FROM df)")
     con.sql("SET enable_external_access = false")
     con.sql("SET lock_configuration = true")
     return con
