@@ -194,9 +194,10 @@
     },
   );
 
-  const debouncedSearch = debounce(doSearch, 500);
+  const debouncedSearch = debounce(doSearch.call, 500);
 
   function clearSearch() {
+    doSearch.cancel();
     searchResultStore.set(null);
     searchResultVisible = false;
   }
@@ -305,7 +306,7 @@
     cache: new ChartContextCache(),
     persistentCache: cache ?? { get: async () => null, set: async (key, value) => {} },
     searchModes: searchModes,
-    search: doSearch,
+    search: doSearch.call,
     searchResult: searchResultStore,
     highlight: writable(null),
     embeddingViewConfig: embeddingViewConfig,
